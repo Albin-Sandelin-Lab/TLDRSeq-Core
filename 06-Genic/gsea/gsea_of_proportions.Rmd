@@ -1,0 +1,206 @@
+---
+title: "GO-term GSEA of RNA-class proportions"
+output: html_document
+---
+
+# Dependencies
+
+This document sources two local files: `../../02-DHS/config_and_libraries.R`, which defines the path helper, and `gsea_engine.R`, the GSEA engine. Everything else it needs is an installed package.
+
+```{r}
+# CRAN / Bioconductor packages
+library(clusterProfiler)   # setReadable(), gseaplot()
+library(enrichplot)        # as.data.frame() for a compareClusterResult
+library(AnnotationDbi)     # mapIds()
+library(org.Mm.eg.db)      # mouse SYMBOL annotation (must be installed)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(plotthis)          # GSEAPlot() for the GSEA running-score panel
+
+# GSEA engine: the wrapper functions the calls below use are in gsea_engine.R.
+source("gsea_engine.R")
+
+# Path helper: env_path() reads each input path from an environment variable and stops when it is unset.
+source("../../02-DHS/config_and_libraries.R")
+```
+
+```{r}
+# Sort the tileplot rows by NES across clusters: widen to one column per cluster, join the cluster NES columns back, and order by the cluster levels.
+helper_order_df_gsea_by_NES = function(df){
+  stopifnot(is.factor(df$Cluster))
+  tmp_df_group = df %>% 
+    pivot_wider(id_cols = "Description",
+                names_from = "Cluster",
+                values_from = "NES",
+                values_fill = 0)
+  df %>% 
+    dplyr::left_join(tmp_df_group, by = c("Description")) %>% 
+    arrange((across(all_of(levels(df$Cluster))))) %>% 
+    mutate(Description = factor(Description, levels = unique(Description)))
+}
+```
+
+# Data
+
+The class proportions are computed per DHS from the per-gene feature counts. Each input path is read from an environment variable (`GSEA_DHS_GENE_MAP_FILE`, `GSEA_GENE_COUNT_FILE`, `GSEA_RESULT_FILE`):
+
+- `df_DHS_gene_unique_map_with_exon_info` — data.frame, one row per DHS, carrying the gene annotation columns `ensembl_gene_id` and `entrezgene_id`.
+- `df_gene_count_long` — data.frame in long form, one row per DHS × genotype × feature, with columns `DHS`, `geno`, `selected_features` and `n` (read count).
+- `tmp_simplified_gsea` — a `compareClusterResult` from an earlier GSEA run, read back for the tile plot; the notebook computes its own four results into `tmp_list` and does not write this file.
+
+```{r}
+df_DHS_gene_unique_map_with_exon_info = readRDS(env_path("GSEA_DHS_GENE_MAP_FILE"))
+
+
+df_gene_count_long = readRDS(env_path("GSEA_GENE_COUNT_FILE"))
+
+df_category_count = df_gene_count_long %>% 
+  mutate(feature_id = str_replace(selected_features, "\\+", "p"),
+         feature_id = str_replace(feature_id, "\\-", "n")) %>% 
+  group_by(DHS, geno, feature_id) %>% 
+  summarise(n = sum(n), .groups = "drop") %>% 
+  filter(geno == "WT",
+         feature_id %in% c("first_exon_pAp",
+             "first_exon_pAn",
+              "gradual_degradation_pAp",
+             "gradual_degradation_pAn",
+              "premature_termination_pAp",
+              "premature_termination_pAn", 
+              "typical_TTS_pAp",
+             "typical_TTS_pAn"
+                           )) %>% 
+  pivot_wider(id_cols = "DHS",
+              names_from = "feature_id",
+              values_from = n)
+
+df_gene_total_count = df_gene_count_long %>% 
+  mutate(feature_id = str_replace(selected_features, "\\+", "p"),
+         feature_id = str_replace(feature_id, "\\-", "n")) %>% 
+  group_by(DHS, geno) %>% 
+  summarise(total_count = sum(n), .groups = "drop") 
+
+df_count_for_binomial = df_category_count %>% 
+  dplyr::left_join(df_gene_total_count %>% 
+                     filter(geno == "WT") %>% 
+                     transmute(DHS, total_count), by = "DHS")
+
+```
+
+# Analysis
+
+## GSEA of proportion
+
+Each class is ranked by its per-DHS share of the WT reads, joined to the gene annotation (Ensembl gene id and Entrez id), and passed to the GO GSEA (`GO_or_KEGG = "GO_ALL"`, mouse, Benjamini-Hochberg FDR, `pcutoff = 0.1`).
+
+```{r}
+df_y = df_count_for_binomial %>%
+   filter(
+     total_count > 0) %>% 
+   mutate(first_exon_pAn = first_exon_pAn / total_count,
+          gradual_degradation_pAn = gradual_degradation_pAn / total_count,
+          premature_termination_pAn = premature_termination_pAn / total_count,
+          typical_TTS_pAp = typical_TTS_pAp / total_count)
+
+tmp_list = list()
+
+for(i in c("first_exon_pAn",
+            "gradual_degradation_pAn",
+            "premature_termination_pAn", 
+            "typical_TTS_pAp")){
+  
+  df_gsea_background = df_y %>% 
+  dplyr::left_join(df_DHS_gene_unique_map_with_exon_info,
+                   by= "DHS") %>% 
+  mutate(gene_id = ensembl_gene_id,
+         entrez_id = entrezgene_id)
+  
+  tmp_list[[i]] = gsea_by_one_coef(df_coef = df_gsea_background, 
+                            coef_name = i,
+                            gene_id_map = df_gsea_background,
+                            pcutoff = 0.1,
+                            GO_or_KEGG = "GO_ALL",
+                            species = "mouse",
+                            pAdjustMethod = "fdr")
+
+  
+}
+```
+
+```{r}
+tmp_list$gradual_degradation_pAn %>% as.data.frame
+```
+
+```{r}
+
+tmp_list$gradual_degradation_pAn %>% clusterProfiler::setReadable(., OrgDb = org.Mm.eg.db)
+clusterProfiler::gseaplot(tmp_list$gradual_degradation_pAn, geneSetID = 6)
+
+tmp_gsea_to_visualize = tmp_list$gradual_degradation_pAn %>% 
+  clusterProfiler::setReadable(OrgDb = org.Mm.eg.db)
+
+gene_ranks = tmp_gsea_to_visualize@geneList %>% as.numeric()
+names(gene_ranks) = names(tmp_gsea_to_visualize@geneList)
+gene_ranks = gene_ranks[!is.na(names(gene_ranks))]
+
+entrez_to_symbol <- mapIds(         
+      org.Mm.eg.db,
+      keys = names(gene_ranks),
+      column = "SYMBOL",  
+      keytype = "ENTREZID", 
+      multiVals = "first"    
+  ) 
+gene_ranks_symbol <- gene_ranks
+names(gene_ranks_symbol) <- entrez_to_symbol[names(gene_ranks)]                              
+gene_ranks_symbol <- gene_ranks_symbol[!is.na(names(gene_ranks_symbol))]    
+
+gene_sets_symbol <- lapply(tmp_gsea_to_visualize@geneSets, function(genes){
+  tmp = entrez_to_symbol[genes]
+  tmp[!is.na(names(tmp))]
+})
+
+attr(tmp_gsea_to_visualize@result, "gene_ranks") <- gene_ranks_symbol
+attr(tmp_gsea_to_visualize@result, "gene_sets") <- gene_sets_symbol 
+  
+plotthis::GSEAPlot(tmp_gsea_to_visualize@result, 
+                    gs = tmp_gsea_to_visualize@result$ID[2],n_coregenes = 20)
+```
+
+### Visualization
+
+The tileplot is built from the merged GSEA result that was saved for `gradual_degradation_pAn`; the four clusters are the four ranked classes.
+
+```{r}
+
+tmp_simplified_gsea = readRDS(env_path("GSEA_RESULT_FILE"))
+
+
+tmp_gsea = tmp_simplified_gsea %>% 
+  fortify.compareClusterResult.withfilter(showCategory = 15,
+                                          by = "geneRatio",
+                                          split = NULL,
+                                          includeAll = TRUE)
+
+tmp_gsea %>% 
+      mutate(Cluster = factor(Cluster,
+                          levels = c(
+                            "typical_TTS_pAp",
+                            "gradual_degradation_pAn",
+                            "premature_termination_pAn",
+                            "first_exon_pAn"
+                                     ))) %>%
+      helper_order_df_gsea_by_NES() %>% 
+      ggplot(., aes(x = Cluster, y = Description),
+             showCategory=showCategory, includeAll = T) +
+      geom_point(aes(color=Direction, size = abs(NES),
+                     alpha = -log10(p.adjust))) +
+      labs(x = "", y = "")+
+      scale_alpha_continuous(range = c(0.5,1))+
+      theme_bw()+
+      theme(axis.text.x =element_text(angle = 90, vjust = 0.5, hjust=1),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank())+
+            theme(legend.position = "none") 
+
+```
